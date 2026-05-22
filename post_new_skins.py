@@ -1,6 +1,7 @@
 """Fetch the current Fortnite item shop and post the day's skins to a Discord channel.
 
-Lists every outfit in the shop, with the ones added recently tagged 🆕. Posts via a
+Shows every outfit in the shop as a compact card with a little icon, rarity-colored
+stripe, and price; skins added recently are tagged 🆕 and pinned to the top. Posts via a
 Discord webhook (no always-on bot process required). Designed to run on a daily schedule
 (e.g. GitHub Actions cron) shortly after the shop resets at 00:00 UTC.
 
@@ -17,10 +18,24 @@ import urllib.request
 from datetime import datetime, timezone
 
 SHOP_URL = "https://fortnite-api.com/v2/shop"
-EMBED_COLOR = 0x7289DA
-# Keep each message's embed body well under Discord's 4096-char description limit.
-PAGE_CHAR_LIMIT = 3800
+EMBEDS_PER_MESSAGE = 10  # Discord's hard limit per webhook message
 NEW_TAG = "\U0001f195"  # 🆕
+
+# Rarity -> card stripe color (matched against the rarity's value/displayValue).
+RARITY_COLORS = {
+    "common": 0xB1B1B1,
+    "uncommon": 0x60AE3F,
+    "rare": 0x49AEED,
+    "epic": 0xB95FF4,
+    "legendary": 0xEA8A35,
+    "mythic": 0xE6C84F,
+    "marvel": 0xED1C24,
+    "dc": 0x0476F2,
+    "star wars": 0xF1C40F,
+    "icon": 0x3DF0E0,
+    "gaming": 0x2C7BE5,
+}
+DEFAULT_COLOR = 0x7289DA
 
 
 def fetch_shop():
@@ -44,10 +59,14 @@ def collect_outfits(shop):
             item_id = item["id"]
             if item_id in outfits:
                 continue  # keep first occurrence (dedupe across bundles)
+            images = item.get("images") or {}
+            rarity = item.get("rarity") or {}
             outfits[item_id] = {
                 "name": item.get("name", "Unknown"),
                 "added": (item.get("added") or "")[:10],
-                "rarity": (item.get("rarity") or {}).get("displayValue", "Unknown"),
+                "rarity": rarity.get("displayValue", "Unknown"),
+                "rarity_key": rarity.get("value", ""),
+                "icon": images.get("smallIcon") or images.get("icon") or images.get("featured"),
                 "price": price,
             }
     return outfits
@@ -61,25 +80,30 @@ def days_since(date_str, today):
         return 10**6  # unparseable date sorts as very old
 
 
-def format_line(o):
-    tag = f"{NEW_TAG} " if o["is_new"] else ""
-    price = f" · {o['price']:,} V-Bucks" if o.get("price") is not None else ""
-    return f"{tag}**{o['name']}** — {o['rarity']}{price}"
+def pick_color(outfit):
+    haystack = f"{outfit.get('rarity_key', '')} {outfit.get('rarity', '')}".lower()
+    for needle, color in RARITY_COLORS.items():
+        if needle in haystack:
+            return color
+    return DEFAULT_COLOR
 
 
-def paginate(lines, limit=PAGE_CHAR_LIMIT):
-    """Pack lines into pages whose joined length stays under `limit`."""
-    pages, current, size = [], [], 0
-    for line in lines:
-        extra = len(line) + 1
-        if current and size + extra > limit:
-            pages.append(current)
-            current, size = [], 0
-        current.append(line)
-        size += extra
-    if current:
-        pages.append(current)
-    return pages
+def make_embed(o):
+    name = f"{NEW_TAG} {o['name']}" if o["is_new"] else o["name"]
+    price = f"  ·  {o['price']:,} V-Bucks" if o.get("price") is not None else ""
+    embed = {
+        "color": pick_color(o),
+        "author": {"name": name},
+        "description": f"{o['rarity']}{price}",
+    }
+    if o.get("icon"):
+        embed["author"]["icon_url"] = o["icon"]
+    return embed
+
+
+def chunk(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
 def build_messages(outfits, new_days, today):
@@ -95,16 +119,14 @@ def build_messages(outfits, new_days, today):
         f"{len(items)} skins, {new_count} new {NEW_TAG}"
     )
 
-    pages = paginate([format_line(o) for o in items]) or [["_No skins found in the shop._"]]
     messages = []
-    for i, page in enumerate(pages):
-        msg = {
-            "username": "Fortnite Shop",
-            "embeds": [{"color": EMBED_COLOR, "description": "\n".join(page)}],
-        }
+    for i, group in enumerate(chunk(items, EMBEDS_PER_MESSAGE) or [[]]):
+        msg = {"username": "Fortnite Shop", "embeds": [make_embed(o) for o in group]}
         if i == 0:
             msg["content"] = header
         messages.append(msg)
+    if not messages:
+        messages.append({"username": "Fortnite Shop", "content": header + "\n_No skins found._"})
     return messages
 
 
@@ -137,12 +159,14 @@ def main():
 
     if not webhook_url:
         print("[dry-run] DISCORD_WEBHOOK_URL not set. Messages that would be posted:\n")
-        print(messages[0]["content"])
+        print(messages[0].get("content", ""))
         for msg in messages:
-            for line in msg["embeds"][0]["description"].split("\n"):
-                print("  " + line.replace("**", ""))
+            for e in msg.get("embeds", []):
+                icon = "[icon]" if e["author"].get("icon_url") else "[no icon]"
+                print(f"  {icon} {e['author']['name']} — {e['description']}")
         return
 
+    status = None
     for msg in messages:
         status = post_to_discord(webhook_url, msg)
     print(f"Posted {len(messages)} message(s) to Discord (last HTTP {status}).")
