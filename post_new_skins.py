@@ -23,12 +23,14 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 SHOP_URL = "https://fortnite-api.com/v2/shop"
 
-# Layout / theme (Discord dark).
-WIDTH = 780
-PAD = 18
-HEADER_H = 60
-ROW_H = 50
-ICON = 38
+# Layout / theme (Discord dark). Scaled up so text stays legible after Discord
+# shrinks the image to fit the message column.
+MAX_IMAGES = 2
+WIDTH = 920
+PAD = 26
+HEADER_H = 78
+ROW_H = 76
+ICON = 56
 BG = (43, 45, 49)
 ROW_ALT = (47, 49, 54)
 WHITE = (255, 255, 255)
@@ -142,23 +144,25 @@ def rounded_icon(img, size, radius=9):
     return img
 
 
-def render_image(items, today):
-    new_count = sum(1 for o in items if o["is_new"])
+def render_image(items, today, total_count, new_total, page_idx, page_count):
     height = HEADER_H + ROW_H * len(items) + PAD
     img = Image.new("RGB", (WIDTH, height), BG)
     draw = ImageDraw.Draw(img)
 
-    f_title = load_font(FONT_CANDIDATES_BOLD, 22)
-    f_name = load_font(FONT_CANDIDATES_BOLD, 16)
-    f_detail = load_font(FONT_CANDIDATES_REG, 15)
-    f_badge = load_font(FONT_CANDIDATES_BOLD, 11)
+    f_title = load_font(FONT_CANDIDATES_BOLD, 34)
+    f_name = load_font(FONT_CANDIDATES_BOLD, 26)
+    f_detail = load_font(FONT_CANDIDATES_REG, 24)
+    f_badge = load_font(FONT_CANDIDATES_BOLD, 17)
 
     # Header
     hy = HEADER_H // 2
-    x = draw.text((PAD, hy), "Fortnite Item Shop", font=f_title, fill=WHITE, anchor="lm")
+    draw.text((PAD, hy), "Fortnite Item Shop", font=f_title, fill=WHITE, anchor="lm")
     title_w = draw.textlength("Fortnite Item Shop", font=f_title)
-    sub = f"   {today:%b %d, %Y}  ·  {len(items)} skins  ·  {new_count} new"
+    sub = f"   {today:%b %d, %Y}  ·  {total_count} skins  ·  {new_total} new"
     draw.text((PAD + title_w, hy), sub, font=f_detail, fill=MUTED, anchor="lm")
+    if page_count > 1:
+        draw.text((WIDTH - PAD, hy), f"{page_idx}/{page_count}", font=f_detail,
+                  fill=MUTED, anchor="rm")
     draw.line([(0, HEADER_H), (WIDTH, HEADER_H)], fill=DIVIDER, width=1)
 
     for i, o in enumerate(items):
@@ -168,28 +172,28 @@ def render_image(items, today):
             draw.rectangle([0, top, WIDTH, top + ROW_H], fill=ROW_ALT)
 
         # Rarity accent bar on the left.
-        draw.rounded_rectangle([PAD - 6, mid - ICON // 2, PAD - 2, mid + ICON // 2],
-                               radius=2, fill=rarity_color(o))
+        draw.rounded_rectangle([PAD - 8, mid - ICON // 2, PAD - 2, mid + ICON // 2],
+                               radius=3, fill=rarity_color(o))
 
         # Thumbnail.
-        icon_x = PAD + 6
+        icon_x = PAD + 8
         icon_y = mid - ICON // 2
         icon = o.get("_icon_img")
         if icon is not None:
             img.paste(icon, (icon_x, icon_y), icon)
         else:
             draw.rounded_rectangle([icon_x, icon_y, icon_x + ICON, icon_y + ICON],
-                                   radius=9, fill=(60, 63, 68))
+                                   radius=12, fill=(60, 63, 68))
 
-        tx = icon_x + ICON + 12
+        tx = icon_x + ICON + 18
 
         # NEW badge.
         if o["is_new"]:
             label = "NEW"
-            bw = draw.textlength(label, font=f_badge) + 12
-            draw.rounded_rectangle([tx, mid - 9, tx + bw, mid + 9], radius=9, fill=BADGE_BG)
+            bw = draw.textlength(label, font=f_badge) + 18
+            draw.rounded_rectangle([tx, mid - 14, tx + bw, mid + 14], radius=14, fill=BADGE_BG)
             draw.text((tx + bw / 2, mid), label, font=f_badge, fill=WHITE, anchor="mm")
-            tx += bw + 8
+            tx += bw + 12
 
         # Name + details on one line.
         draw.text((tx, mid), o["name"], font=f_name, fill=WHITE, anchor="lm")
@@ -245,19 +249,29 @@ def main():
     for o in items:
         o["_icon_img"] = rounded_icon(fetch_icon(o["icon"]), ICON) if o.get("icon") else None
 
-    png = render_image(items, today)
-    new_count = sum(1 for o in items if o["is_new"])
+    total = len(items)
+    new_total = sum(1 for o in items if o["is_new"])
+    # Split across at most MAX_IMAGES images.
+    per_image = -(-total // MAX_IMAGES) if total else 0  # ceil division
+    pages = [items[i:i + per_image] for i in range(0, total, per_image)] or [[]]
+
     content = (f"\U0001f6d2 **Fortnite Item Shop — {today:%b %d, %Y}** · "
-               f"{len(items)} skins, {new_count} new")
+               f"{total} skins, {new_total} new")
 
     if not webhook_url:
-        with open("shop_preview.png", "wb") as fh:
-            fh.write(png)
-        print(f"[dry-run] Wrote shop_preview.png ({len(png):,} bytes, {len(items)} skins).")
+        for idx, page in enumerate(pages, start=1):
+            png = render_image(page, today, total, new_total, idx, len(pages))
+            name = "shop_preview.png" if len(pages) == 1 else f"shop_preview_{idx}.png"
+            with open(name, "wb") as fh:
+                fh.write(png)
+            print(f"[dry-run] Wrote {name} ({len(png):,} bytes, {len(page)} skins).")
         return
 
-    status = post_image(webhook_url, png, content)
-    print(f"Posted shop image to Discord ({len(items)} skins, HTTP {status}).")
+    status = None
+    for idx, page in enumerate(pages, start=1):
+        png = render_image(page, today, total, new_total, idx, len(pages))
+        status = post_image(webhook_url, png, content if idx == 1 else "")
+    print(f"Posted {len(pages)} image(s) to Discord ({total} skins, last HTTP {status}).")
 
 
 if __name__ == "__main__":
