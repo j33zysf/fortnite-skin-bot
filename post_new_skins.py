@@ -1,12 +1,12 @@
-"""Fetch the current Fortnite item shop and post the newest skins to a Discord channel.
+"""Fetch the current Fortnite item shop and post the day's skins to a Discord channel.
 
-Posts via a Discord webhook (no always-on bot process required). Designed to run on a
-daily schedule (e.g. GitHub Actions cron) shortly after the shop resets at 00:00 UTC.
+Lists every outfit in the shop, with the ones added recently tagged 🆕. Posts via a
+Discord webhook (no always-on bot process required). Designed to run on a daily schedule
+(e.g. GitHub Actions cron) shortly after the shop resets at 00:00 UTC.
 
 Environment variables:
   DISCORD_WEBHOOK_URL  (required to actually post; if unset, runs in dry-run/print mode)
-  NEW_DAYS             (optional, default 2) skins added within this many days = "brand new"
-  MAX_SKINS            (optional, default 10) max skins to show (Discord caps embeds at 10)
+  NEW_DAYS             (optional, default 2) skins added within this many days get the 🆕 tag
   FORTNITE_API_KEY     (optional) sent as Authorization header to fortnite-api.com
 """
 
@@ -17,22 +17,10 @@ import urllib.request
 from datetime import datetime, timezone
 
 SHOP_URL = "https://fortnite-api.com/v2/shop"
-
-# Rarity -> embed sidebar color (hex as int). Falls back to a neutral gray.
-RARITY_COLORS = {
-    "common": 0xB1B1B1,
-    "uncommon": 0x60AE3F,
-    "rare": 0x49AEED,
-    "epic": 0xB95FF4,
-    "legendary": 0xEA8A35,
-    "mythic": 0xE6C84F,
-    "marvel": 0xED1C24,
-    "dc": 0x2980B9,
-    "icon": 0x3DF0E0,
-    "gaming": 0x2C7BE5,
-    "star wars": 0xF1C40F,
-}
-DEFAULT_COLOR = 0x7289DA
+EMBED_COLOR = 0x7289DA
+# Keep each message's embed body well under Discord's 4096-char description limit.
+PAGE_CHAR_LIMIT = 3800
+NEW_TAG = "\U0001f195"  # 🆕
 
 
 def fetch_shop():
@@ -56,15 +44,11 @@ def collect_outfits(shop):
             item_id = item["id"]
             if item_id in outfits:
                 continue  # keep first occurrence (dedupe across bundles)
-            images = item.get("images") or {}
             outfits[item_id] = {
                 "name": item.get("name", "Unknown"),
                 "added": (item.get("added") or "")[:10],
                 "rarity": (item.get("rarity") or {}).get("displayValue", "Unknown"),
-                "rarity_key": (item.get("rarity") or {}).get("value", ""),
-                "icon": images.get("icon") or images.get("featured") or images.get("smallIcon"),
                 "price": price,
-                "series": (item.get("series") or {}).get("value"),
             }
     return outfits
 
@@ -77,49 +61,51 @@ def days_since(date_str, today):
         return 10**6  # unparseable date sorts as very old
 
 
-def pick_color(outfit):
-    key = (outfit.get("rarity_key") or "").lower()
-    name = (outfit.get("rarity") or "").lower()
-    for needle, color in RARITY_COLORS.items():
-        if needle in key or needle in name:
-            return color
-    return DEFAULT_COLOR
+def format_line(o):
+    tag = f"{NEW_TAG} " if o["is_new"] else ""
+    price = f" · {o['price']:,} V-Bucks" if o.get("price") is not None else ""
+    return f"{tag}**{o['name']}** — {o['rarity']}{price}"
 
 
-def build_payload(outfits, new_days, max_skins, today):
-    ordered = sorted(outfits.values(), key=lambda o: o["added"], reverse=True)
-    brand_new = [o for o in ordered if days_since(o["added"], today) <= new_days]
+def paginate(lines, limit=PAGE_CHAR_LIMIT):
+    """Pack lines into pages whose joined length stays under `limit`."""
+    pages, current, size = [], [], 0
+    for line in lines:
+        extra = len(line) + 1
+        if current and size + extra > limit:
+            pages.append(current)
+            current, size = [], 0
+        current.append(line)
+        size += extra
+    if current:
+        pages.append(current)
+    return pages
 
-    if brand_new:
-        chosen = brand_new[:max_skins]
-        header = f"🛒 **{len(brand_new)} new skin(s) in the Fortnite shop today** ({today:%b %d, %Y})"
-    else:
-        chosen = ordered[:max_skins]
-        header = (
-            f"🛒 **No brand-new skins today** ({today:%b %d, %Y}) — "
-            "here are the most recently added ones in the shop:"
-        )
 
-    embeds = []
-    for o in chosen:
-        fields = [{"name": "Rarity", "value": o["rarity"], "inline": True}]
-        if o.get("price") is not None:
-            fields.append({"name": "Price", "value": f"{o['price']:,} V-Bucks", "inline": True})
-        embed = {
-            "title": o["name"],
-            "color": pick_color(o),
-            "fields": fields,
-            "footer": {"text": f"Added {o['added']}"},
+def build_messages(outfits, new_days, today):
+    items = list(outfits.values())
+    for o in items:
+        o["is_new"] = days_since(o["added"], today) <= new_days
+    # New skins first, then everything else; alphabetical within each group.
+    items.sort(key=lambda o: (not o["is_new"], o["name"].lower()))
+
+    new_count = sum(1 for o in items if o["is_new"])
+    header = (
+        f"\U0001f6d2 **Fortnite Item Shop — {today:%b %d, %Y}**  ·  "
+        f"{len(items)} skins, {new_count} new {NEW_TAG}"
+    )
+
+    pages = paginate([format_line(o) for o in items]) or [["_No skins found in the shop._"]]
+    messages = []
+    for i, page in enumerate(pages):
+        msg = {
+            "username": "Fortnite Shop",
+            "embeds": [{"color": EMBED_COLOR, "description": "\n".join(page)}],
         }
-        if o.get("icon"):
-            embed["thumbnail"] = {"url": o["icon"]}
-        embeds.append(embed)
-
-    return {
-        "username": "Fortnite Shop",
-        "content": header,
-        "embeds": embeds,
-    }
+        if i == 0:
+            msg["content"] = header
+        messages.append(msg)
+    return messages
 
 
 def post_to_discord(webhook_url, payload):
@@ -140,7 +126,6 @@ def main():
     except (AttributeError, ValueError):
         pass
     new_days = int(os.environ.get("NEW_DAYS", "2"))
-    max_skins = max(1, min(10, int(os.environ.get("MAX_SKINS", "10"))))
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     today = datetime.now(timezone.utc)
 
@@ -148,19 +133,19 @@ def main():
     if shop.get("status") != 200:
         raise SystemExit(f"Shop API returned status {shop.get('status')}")
 
-    outfits = collect_outfits(shop)
-    payload = build_payload(outfits, new_days, max_skins, today)
+    messages = build_messages(collect_outfits(shop), new_days, today)
 
     if not webhook_url:
-        print("[dry-run] DISCORD_WEBHOOK_URL not set. Payload that would be posted:\n")
-        print(payload["content"])
-        for e in payload["embeds"]:
-            price = next((f["value"] for f in e["fields"] if f["name"] == "Price"), "—")
-            print(f"  - {e['title']} | {e['fields'][0]['value']} | {price} | {e['footer']['text']}")
+        print("[dry-run] DISCORD_WEBHOOK_URL not set. Messages that would be posted:\n")
+        print(messages[0]["content"])
+        for msg in messages:
+            for line in msg["embeds"][0]["description"].split("\n"):
+                print("  " + line.replace("**", ""))
         return
 
-    status = post_to_discord(webhook_url, payload)
-    print(f"Posted {len(payload['embeds'])} skin(s) to Discord (HTTP {status}).")
+    for msg in messages:
+        status = post_to_discord(webhook_url, msg)
+    print(f"Posted {len(messages)} message(s) to Discord (last HTTP {status}).")
 
 
 if __name__ == "__main__":

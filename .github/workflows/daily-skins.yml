@@ -20,5 +20,4 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORTNITE_API_KEY: ${{ secrets.FORTNITE_API_KEY }}
           NEW_DAYS: "2"
-          MAX_SKINS: "10"
         run: python post_new_skins.py
