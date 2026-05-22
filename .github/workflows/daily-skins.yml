@@ -1,0 +1,24 @@
+name: Daily Fortnite skins
+
+on:
+  schedule:
+    # Fortnite shop resets at 00:00 UTC. Run a few minutes after to let the API update.
+    # (GitHub may delay scheduled runs by several minutes under load.)
+    - cron: "10 0 * * *"
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Post newest skins to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORTNITE_API_KEY: ${{ secrets.FORTNITE_API_KEY }}
+          NEW_DAYS: "2"
+          MAX_SKINS: "10"
+        run: python post_new_skins.py
