@@ -1,41 +1,66 @@
 """Fetch the current Fortnite item shop and post the day's skins to a Discord channel.
 
-Shows every outfit in the shop as a compact card with a little icon, rarity-colored
-stripe, and price; skins added recently are tagged 🆕 and pinned to the top. Posts via a
-Discord webhook (no always-on bot process required). Designed to run on a daily schedule
-(e.g. GitHub Actions cron) shortly after the shop resets at 00:00 UTC.
+Renders the whole shop as a single image: one row per outfit with a thumbnail, a
+rarity-colored accent, the name, and rarity / price. Skins added recently get a NEW
+badge and are pinned to the top. Posts the image via a Discord webhook (no always-on
+bot needed). Designed to run daily (e.g. GitHub Actions cron) just after the shop
+resets at 00:00 UTC.
 
 Environment variables:
-  DISCORD_WEBHOOK_URL  (required to actually post; if unset, runs in dry-run/print mode)
-  NEW_DAYS             (optional, default 2) skins added within this many days get the 🆕 tag
+  DISCORD_WEBHOOK_URL  (required to post; if unset, writes shop_preview.png locally)
+  NEW_DAYS             (optional, default 2) skins added within this many days get NEW
   FORTNITE_API_KEY     (optional) sent as Authorization header to fortnite-api.com
 """
 
+import io
 import json
 import os
-import sys
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 
-SHOP_URL = "https://fortnite-api.com/v2/shop"
-EMBEDS_PER_MESSAGE = 10  # Discord's hard limit per webhook message
-NEW_TAG = "\U0001f195"  # 🆕
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-# Rarity -> card stripe color (matched against the rarity's value/displayValue).
+SHOP_URL = "https://fortnite-api.com/v2/shop"
+
+# Layout / theme (Discord dark).
+WIDTH = 780
+PAD = 18
+HEADER_H = 60
+ROW_H = 50
+ICON = 38
+BG = (43, 45, 49)
+ROW_ALT = (47, 49, 54)
+WHITE = (255, 255, 255)
+MUTED = (181, 186, 193)
+DIVIDER = (60, 63, 68)
+BADGE_BG = (235, 69, 43)
+
 RARITY_COLORS = {
-    "common": 0xB1B1B1,
-    "uncommon": 0x60AE3F,
-    "rare": 0x49AEED,
-    "epic": 0xB95FF4,
-    "legendary": 0xEA8A35,
-    "mythic": 0xE6C84F,
-    "marvel": 0xED1C24,
-    "dc": 0x0476F2,
-    "star wars": 0xF1C40F,
-    "icon": 0x3DF0E0,
-    "gaming": 0x2C7BE5,
+    "common": (177, 177, 177),
+    "uncommon": (96, 174, 63),
+    "rare": (73, 174, 237),
+    "epic": (185, 95, 244),
+    "legendary": (234, 138, 53),
+    "mythic": (230, 200, 79),
+    "marvel": (237, 28, 36),
+    "dc": (4, 118, 242),
+    "star wars": (241, 196, 15),
+    "icon": (61, 240, 224),
+    "gaming": (44, 123, 229),
 }
-DEFAULT_COLOR = 0x7289DA
+DEFAULT_COLOR = (114, 137, 218)
+
+FONT_CANDIDATES_BOLD = [
+    r"C:\Windows\Fonts\segoeuib.ttf",
+    r"C:\Windows\Fonts\arialbd.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+FONT_CANDIDATES_REG = [
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
 
 
 def fetch_shop():
@@ -66,7 +91,7 @@ def collect_outfits(shop):
                 "added": (item.get("added") or "")[:10],
                 "rarity": rarity.get("displayValue", "Unknown"),
                 "rarity_key": rarity.get("value", ""),
-                "icon": images.get("smallIcon") or images.get("icon") or images.get("featured"),
+                "icon": images.get("icon") or images.get("smallIcon") or images.get("featured"),
                 "price": price,
             }
     return outfits
@@ -80,73 +105,130 @@ def days_since(date_str, today):
         return 10**6  # unparseable date sorts as very old
 
 
-def pick_color(outfit):
-    haystack = f"{outfit.get('rarity_key', '')} {outfit.get('rarity', '')}".lower()
+def rarity_color(o):
+    haystack = f"{o.get('rarity_key', '')} {o.get('rarity', '')}".lower()
     for needle, color in RARITY_COLORS.items():
         if needle in haystack:
             return color
     return DEFAULT_COLOR
 
 
-def make_embed(o):
-    name = f"{NEW_TAG} {o['name']}" if o["is_new"] else o["name"]
-    price = f"  ·  {o['price']:,} V-Bucks" if o.get("price") is not None else ""
-    embed = {
-        "color": pick_color(o),
-        "author": {"name": name},
-        "description": f"{o['rarity']}{price}",
-    }
-    if o.get("icon"):
-        embed["author"]["icon_url"] = o["icon"]
-    return embed
+def load_font(candidates, size):
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default(size)
 
 
-def chunk(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
+def fetch_icon(url):
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "fortnite-skin-bot"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return Image.open(io.BytesIO(resp.read())).convert("RGBA")
+    except Exception:
+        return None
 
 
-def build_messages(outfits, new_days, today):
-    items = list(outfits.values())
-    for o in items:
-        o["is_new"] = days_since(o["added"], today) <= new_days
-    # New skins first, then everything else; alphabetical within each group.
-    items.sort(key=lambda o: (not o["is_new"], o["name"].lower()))
+def rounded_icon(img, size, radius=9):
+    img = img.resize((size, size), Image.LANCZOS)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
+    combined = ImageChops.multiply(img.split()[3], mask)
+    img.putalpha(combined)
+    return img
 
+
+def render_image(items, today):
     new_count = sum(1 for o in items if o["is_new"])
-    header = (
-        f"\U0001f6d2 **Fortnite Item Shop — {today:%b %d, %Y}**  ·  "
-        f"{len(items)} skins, {new_count} new {NEW_TAG}"
-    )
+    height = HEADER_H + ROW_H * len(items) + PAD
+    img = Image.new("RGB", (WIDTH, height), BG)
+    draw = ImageDraw.Draw(img)
 
-    messages = []
-    for i, group in enumerate(chunk(items, EMBEDS_PER_MESSAGE) or [[]]):
-        msg = {"username": "Fortnite Shop", "embeds": [make_embed(o) for o in group]}
-        if i == 0:
-            msg["content"] = header
-        messages.append(msg)
-    if not messages:
-        messages.append({"username": "Fortnite Shop", "content": header + "\n_No skins found._"})
-    return messages
+    f_title = load_font(FONT_CANDIDATES_BOLD, 22)
+    f_name = load_font(FONT_CANDIDATES_BOLD, 16)
+    f_detail = load_font(FONT_CANDIDATES_REG, 15)
+    f_badge = load_font(FONT_CANDIDATES_BOLD, 11)
+
+    # Header
+    hy = HEADER_H // 2
+    x = draw.text((PAD, hy), "Fortnite Item Shop", font=f_title, fill=WHITE, anchor="lm")
+    title_w = draw.textlength("Fortnite Item Shop", font=f_title)
+    sub = f"   {today:%b %d, %Y}  ·  {len(items)} skins  ·  {new_count} new"
+    draw.text((PAD + title_w, hy), sub, font=f_detail, fill=MUTED, anchor="lm")
+    draw.line([(0, HEADER_H), (WIDTH, HEADER_H)], fill=DIVIDER, width=1)
+
+    for i, o in enumerate(items):
+        top = HEADER_H + i * ROW_H
+        mid = top + ROW_H // 2
+        if i % 2 == 1:
+            draw.rectangle([0, top, WIDTH, top + ROW_H], fill=ROW_ALT)
+
+        # Rarity accent bar on the left.
+        draw.rounded_rectangle([PAD - 6, mid - ICON // 2, PAD - 2, mid + ICON // 2],
+                               radius=2, fill=rarity_color(o))
+
+        # Thumbnail.
+        icon_x = PAD + 6
+        icon_y = mid - ICON // 2
+        icon = o.get("_icon_img")
+        if icon is not None:
+            img.paste(icon, (icon_x, icon_y), icon)
+        else:
+            draw.rounded_rectangle([icon_x, icon_y, icon_x + ICON, icon_y + ICON],
+                                   radius=9, fill=(60, 63, 68))
+
+        tx = icon_x + ICON + 12
+
+        # NEW badge.
+        if o["is_new"]:
+            label = "NEW"
+            bw = draw.textlength(label, font=f_badge) + 12
+            draw.rounded_rectangle([tx, mid - 9, tx + bw, mid + 9], radius=9, fill=BADGE_BG)
+            draw.text((tx + bw / 2, mid), label, font=f_badge, fill=WHITE, anchor="mm")
+            tx += bw + 8
+
+        # Name + details on one line.
+        draw.text((tx, mid), o["name"], font=f_name, fill=WHITE, anchor="lm")
+        tx += draw.textlength(o["name"], font=f_name)
+        price = f"  ·  {o['price']:,} V-Bucks" if o.get("price") is not None else ""
+        draw.text((tx, mid), f"   {o['rarity']}{price}", font=f_detail, fill=MUTED, anchor="lm")
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
-def post_to_discord(webhook_url, payload):
-    data = json.dumps(payload).encode("utf-8")
+def post_image(webhook_url, png_bytes, content):
+    boundary = "----fnbot" + uuid.uuid4().hex
+    payload = json.dumps({"username": "Fortnite Shop", "content": content})
+    body = b""
+    body += (f"--{boundary}\r\n"
+             'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
+             f"{payload}\r\n").encode()
+    body += (f"--{boundary}\r\n"
+             'Content-Disposition: form-data; name="files[0]"; filename="shop.png"\r\n'
+             "Content-Type: image/png\r\n\r\n").encode()
+    body += png_bytes + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
     req = urllib.request.Request(
         webhook_url,
-        data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "fortnite-skin-bot"},
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "fortnite-skin-bot",
+        },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.status
 
 
 def main():
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")  # so emoji print works on Windows consoles
-    except (AttributeError, ValueError):
-        pass
     new_days = int(os.environ.get("NEW_DAYS", "2"))
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     today = datetime.now(timezone.utc)
@@ -155,21 +237,27 @@ def main():
     if shop.get("status") != 200:
         raise SystemExit(f"Shop API returned status {shop.get('status')}")
 
-    messages = build_messages(collect_outfits(shop), new_days, today)
+    items = list(collect_outfits(shop).values())
+    for o in items:
+        o["is_new"] = days_since(o["added"], today) <= new_days
+    items.sort(key=lambda o: (not o["is_new"], o["name"].lower()))
+
+    for o in items:
+        o["_icon_img"] = rounded_icon(fetch_icon(o["icon"]), ICON) if o.get("icon") else None
+
+    png = render_image(items, today)
+    new_count = sum(1 for o in items if o["is_new"])
+    content = (f"\U0001f6d2 **Fortnite Item Shop — {today:%b %d, %Y}** · "
+               f"{len(items)} skins, {new_count} new")
 
     if not webhook_url:
-        print("[dry-run] DISCORD_WEBHOOK_URL not set. Messages that would be posted:\n")
-        print(messages[0].get("content", ""))
-        for msg in messages:
-            for e in msg.get("embeds", []):
-                icon = "[icon]" if e["author"].get("icon_url") else "[no icon]"
-                print(f"  {icon} {e['author']['name']} — {e['description']}")
+        with open("shop_preview.png", "wb") as fh:
+            fh.write(png)
+        print(f"[dry-run] Wrote shop_preview.png ({len(png):,} bytes, {len(items)} skins).")
         return
 
-    status = None
-    for msg in messages:
-        status = post_to_discord(webhook_url, msg)
-    print(f"Posted {len(messages)} message(s) to Discord (last HTTP {status}).")
+    status = post_image(webhook_url, png, content)
+    print(f"Posted shop image to Discord ({len(items)} skins, HTTP {status}).")
 
 
 if __name__ == "__main__":
